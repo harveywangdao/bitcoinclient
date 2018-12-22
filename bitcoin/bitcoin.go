@@ -65,61 +65,24 @@ func (b *BitcoinClient) GetBalance(account string) (float64, error) {
 	return asset.ToBTC(), nil
 }
 
-func (b *BitcoinClient) Transfer(from, to string, num float64) (string, error) {
-	toAddress, err := btcutil.DecodeAddress(to, &chaincfg.MainNetParams)
+func (b *BitcoinClient) QueryTransaction(txid string) error {
+	txHash, err := chainhash.NewHashFromStr(txid)
 	if err != nil {
 		logger.Error(err)
-		return "", err
+		return err
 	}
 
-	amount, err := btcutil.NewAmount(num)
+	tx, err := b.cli.GetTransaction(txHash)
 	if err != nil {
 		logger.Error(err)
-		return "", err
-	}
-
-	inputs := []btcjson.TransactionInput{}
-	input := btcjson.TransactionInput{
-		Txid: "441b096b2059eb782a4c60b7bc8538bc6cb7e0f5fb3c0e7c70aa46cfa1d55f02",
-		Vout: 0,
-	}
-	inputs = append(inputs, input)
-
-	amounts := make(map[btcutil.Address]btcutil.Amount)
-	amounts[toAddress] = amount
-
-	lockTime := int64(0)
-
-	tx, err := b.cli.CreateRawTransaction(inputs, amounts, &lockTime)
-	if err != nil {
-		logger.Error(err)
-		return "", err
+		return err
 	}
 
 	data, _ := json.Marshal(tx)
+
 	logger.Info(string(data))
 
-	signedTx, complete, err := b.cli.SignRawTransaction(tx)
-	if err != nil {
-		logger.Error(err)
-		return "", err
-	}
-
-	data, _ = json.Marshal(signedTx)
-	logger.Info(string(data))
-
-	if !complete {
-		logger.Error("sign not complete")
-		return "", errors.New("sign not complete")
-	}
-
-	/*	txHash, err := b.cli.SendRawTransaction(signedTx, allowHighFees)
-		if err != nil {
-			logger.Error(err)
-			return "", err
-		}*/
-
-	return "txHash.String()", nil
+	return nil
 }
 
 func (b *BitcoinClient) TransferTo(to string, num float64) (string, error) {
@@ -144,24 +107,119 @@ func (b *BitcoinClient) TransferTo(to string, num float64) (string, error) {
 	return txid.String(), nil
 }
 
-func (b *BitcoinClient) QueryTransaction(txid string) error {
-	txHash, err := chainhash.NewHashFromStr(txid)
+func (b *BitcoinClient) GetInputs(num, fee float64) ([]btcjson.TransactionInput, float64, error) {
+	var inputs []btcjson.TransactionInput
+
+	uns, err := b.cli.ListUnspent()
 	if err != nil {
 		logger.Error(err)
-		return err
+		return nil, 0.0, err
 	}
 
-	tx, err := b.cli.GetTransaction(txHash)
+	data, _ := json.Marshal(uns)
+	logger.Debug(string(data))
+
+	var sum float64
+	for i := 0; i < len(uns); i++ {
+		if !uns[i].Spendable {
+			continue
+		}
+
+		if uns[i].Vout != 0 {
+			logger.Infof("%+v\n", uns[i])
+		}
+
+		input := btcjson.TransactionInput{
+			Txid: uns[i].TxID,
+			Vout: uns[i].Vout,
+		}
+		inputs = append(inputs, input)
+
+		sum += uns[i].Amount
+		if sum >= num+fee {
+			break
+		}
+	}
+
+	if sum < num+fee {
+		return nil, 0.0, errors.New("not sufficient funds")
+	}
+
+	return inputs, sum, nil
+}
+
+func (b *BitcoinClient) Transfer(from, to string, num, fee float64) (string, error) {
+	if num <= 0.0 || fee <= 0.0 {
+		return "", errors.New("num or fee can not be less than 0")
+	}
+
+	fromAddress, err := btcutil.DecodeAddress(from, &chaincfg.MainNetParams)
 	if err != nil {
 		logger.Error(err)
-		return err
+		return "", err
+	}
+
+	toAddress, err := btcutil.DecodeAddress(to, &chaincfg.MainNetParams)
+	if err != nil {
+		logger.Error(err)
+		return "", err
+	}
+
+	inputs, sum, err := b.GetInputs(num, fee)
+	if err != nil {
+		logger.Error(err)
+		return "", err
+	}
+
+	amount, err := btcutil.NewAmount(num)
+	if err != nil {
+		logger.Error(err)
+		return "", err
+	}
+
+	changeAmount, err := btcutil.NewAmount(sum - num - fee)
+	if err != nil {
+		logger.Error(err)
+		return "", err
+	}
+
+	amounts := make(map[btcutil.Address]btcutil.Amount)
+	amounts[toAddress] = amount
+	amounts[fromAddress] = changeAmount
+
+	lockTime := int64(0)
+
+	tx, err := b.cli.CreateRawTransaction(inputs, amounts, &lockTime)
+	if err != nil {
+		logger.Error(err)
+		return "", err
 	}
 
 	data, _ := json.Marshal(tx)
+	logger.Debug(string(data))
 
-	logger.Info(string(data))
+	signedTx, complete, err := b.cli.SignRawTransaction(tx)
+	if err != nil {
+		logger.Error(err)
+		return "", err
+	}
 
-	return nil
+	data, _ = json.Marshal(signedTx)
+	logger.Debug(string(data))
+
+	if !complete {
+		logger.Error("sign not complete")
+		return "", errors.New("sign not complete")
+	}
+
+	txHash, err := b.cli.SendRawTransaction(signedTx, true)
+	if err != nil {
+		logger.Error(err)
+		return "", err
+	}
+	logger.Info(txHash.String())
+
+	return txHash.String(), nil
 }
 
 func (b *BitcoinClient) testApi() error {
@@ -179,7 +237,7 @@ func (b *BitcoinClient) testApi() error {
 			return err
 		}
 
-		txid, err := b.TransferTo("2N9AGxxi5uY9iHCExX63iRiyrMa4A4ABV9t", 14.0)
+		txid, err := b.TransferTo("2MzxYfzCuVUwaKTaxB48cX4Noh7RqcWByGM", 14.0)
 		if err != nil {
 			logger.Error(err)
 			return err
@@ -191,7 +249,7 @@ func (b *BitcoinClient) testApi() error {
 			return err
 		}*/
 
-	_, err = b.Transfer("", "2N9AGxxi5uY9iHCExX63iRiyrMa4A4ABV9t", 14.0)
+	_, err = b.Transfer("2N1H1D5pWTJvWpeJoZYL1z4NpuW48LWvGhr", "2MzxYfzCuVUwaKTaxB48cX4Noh7RqcWByGM", 3199.0, 1.0)
 	if err != nil {
 		logger.Error(err)
 		return err
